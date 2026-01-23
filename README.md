@@ -39,7 +39,7 @@ pip install PyQt5 lz4
 ### Usage
 
 ```bash
-python roblox_explorer_v10_5.pyw
+python RBXLtoText.pyw
 ```
 
 Or simply double-click the `.pyw` file on Windows.
