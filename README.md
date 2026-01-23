@@ -10,7 +10,6 @@ A powerful desktop application for extracting scripts and data from Roblox place
 - **📄 Multiple Export Formats** - Export as TXT, LUA, or LUAU
 - **🔧 Rojo Compatibility** - LUAU export with client/server/shared folder structure
 - **📦 Batch Export** - Select multiple items and export them all at once
-- **🎨 Dark Theme** - Beautiful cyberpunk-inspired dark UI
 
 ---
 
@@ -128,5 +127,3 @@ MIT License - Free to use and modify.
 🌐 [undmg.github.io](https://undmg.github.io)
 
 ---
-
-*Made with ❤️ for the Roblox developer community*
