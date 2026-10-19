@@ -1,0 +1,2 @@
+# Generated test files: keep them out of diffs and language stats
+tests/fixtures/** linguist-generated=true -diff

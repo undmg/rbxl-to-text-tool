@@ -1,129 +1,151 @@
 # RBXL to Text Tool
 
-A powerful desktop application for extracting scripts and data from Roblox place files (.rbxl / .rbxlx).
+Read, diff and check Roblox place and model files (`.rbxl`, `.rbxlx`, `.rbxm`, `.rbxmx`) **without opening Studio**.
+
+It comes in two parts that share one parser:
+
+- **`rbxtool`**: a command-line tool for terminals, Git and CI (GitHub Actions).
+- **The desktop app** (`RBXL to Text.pyw`): browse a place as a tree and export scripts.
+
+Why outside Studio? A plugin only sees the one place open in Studio. This tool works on files: in Git history, in CI, on a folder of downloaded models, or on a damaged file Studio refuses to open.
 
 ---
 
-## ✨ Features
-
-- **🔍 Visual Explorer** - Browse the entire hierarchy of your Roblox place file in a tree view
-- **📄 Multiple Export Formats** - Export as TXT, LUA, or LUAU
-- **🔧 Rojo Compatibility** - LUAU export with client/server/shared folder structure
-- **📦 Batch Export** - Select multiple items and export them all at once
-
----
-
-## 📥 Supported Formats
-
-| Format | Description |
-|--------|-------------|
-| **TXT** | All scripts + descriptions + paths in a single readable text file. Includes Models, Folders, Remotes, and other objects. Supports auto-split for large exports. |
-| **LUA** | Each script exported as a separate `.lua` file. Preserves Roblox folder structure. Extensions: `.client.lua`, `.server.lua`, `.module.lua` |
-| **LUAU** | Rojo-compatible structure with `.luau` extension. Optional folder mapping: StarterPlayerScripts → `client/`, ServerScriptService → `server/`, ReplicatedStorage → `shared/` |
-
----
-
-## 🚀 Getting Started
-
-### Requirements
-
-- Python 3.8+
-- PyQt5
-
-### Installation
+## Install
 
 ```bash
-pip install PyQt5 lz4
+pip install git+https://github.com/undmg/rbxl-to-text-tool
 ```
 
-### Usage
+Python 3.9 or newer. For the desktop app also run `pip install PyQt5`.
+
+---
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `rbxtool dump place.rbxl` | Show the instance tree. `-s` adds script source, `-p` adds properties, attributes and tags, `--json` gives everything as JSON. |
+| `rbxtool map place.rbxl` | One-page overview: every script, which modules it requires, and which scripts fire and handle each remote. |
+| `rbxtool diff old.rbxl new.rbxl` | What was added, removed and changed, with line-by-line script diffs. `--format markdown` for PR comments. |
+| `rbxtool check place.rbxl` | Find backdoors, leaked secrets, broken remotes and more (see below). Exits with code 1 when it finds errors, so CI can block a build. |
+| `rbxtool stats place.rbxl` | What makes the file big: bytes on disk per class and property, largest scripts and values. |
+| `rbxtool export place.rbxl out/` | Write scripts to files with Rojo naming. `--project` also writes `default.project.json` so `rojo serve` works. |
+| `rbxtool git-setup --apply` | Make `git diff` show `.rbxl` files as readable text (see below). |
+
+### Readable Git diffs
+
+Git normally says `Binary files differ` for place files. After `rbxtool git-setup --apply` in your repository, `git diff`, `git log -p` and `git show` print the real changes:
+
+```diff
+@@ -6,8 +6,9 @@ [Workspace.Lava] Part
+   Anchored = true
+-  Size = 10, 1, 10
+-  @Damage = 25
++  Size = 20, 1, 10
++  @Damage = 50
+```
+
+Commit the `.gitattributes` file it creates. Each teammate runs `rbxtool git-setup --apply` once (Git doesn't share config through the repository).
+
+### Checks
+
+| Rule | Severity | Finds |
+|---|---|---|
+| RBX001 | error | `require(<number>)`, the classic free-model backdoor |
+| RBX002 | error | `loadstring()` |
+| RBX003 | warning | `getfenv` / `setfenv` |
+| RBX004 | error | `require`, `loadstring` etc. hidden with escape codes or passed around as strings |
+| RBX005 | error | Discord/Slack webhooks and API keys in scripts (the secret is never printed) |
+| RBX006 | warning | Obfuscated code |
+| RBX007 | warning | `LoadAsset(<number>)` |
+| RBX010 | info | `wait`/`spawn`/`delay` and `Instance.new(class, parent)` |
+| RBX020 | warning | A remote that's fired, but nothing handles it on the other side |
+| RBX021 | info | A remote no script uses |
+| RBX030 | error | A damaged file |
+| RBX031 | error | A file over its size budget, or growing too fast |
+
+`rbxtool check --list-rules` prints this list. Check a whole folder of downloaded models with `rbxtool check models/`.
+
+To silence a finding, add a comment on that line or on the line above it:
+
+```lua
+wait(1) -- rbxtool: ignore RBX010
+```
+
+`-- rbxtool: ignore-file RBX010` anywhere in a script silences that rule for the whole script.
+
+Project-wide settings go in an `rbxtool.toml` (see [`rbxtool.example.toml`](rbxtool.example.toml)).
+
+### GitHub Actions
+
+```yaml
+# .github/workflows/place-check.yml
+on: [pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install git+https://github.com/undmg/rbxl-to-text-tool
+      - run: rbxtool check game.rbxl --format github
+```
+
+`--format github` shows each finding as an annotation on the pull request. For Rojo projects, run `rojo build -o game.rbxl` first and check the built file.
+
+### Damaged files
+
+A file that's truncated or partly corrupted still loads: the tool skips the broken parts, recovers everything else, and reports what it lost. `rbxtool dump -s broken.rbxl` shows which scripts survived, and `rbxtool export` saves them.
+
+---
+
+## Desktop app
 
 ```bash
-python RBXLtoText.pyw
+pip install PyQt5 lz4 zstandard
+python "RBXL to Text.pyw"
 ```
 
-Or simply double-click the `.pyw` file on Windows.
+On Windows you can also double-click the `.pyw` file.
+
+1. Click **Select Roblox Place File** and open a `.rbxl`, `.rbxlx`, `.rbxm` or `.rbxmx`.
+2. Browse the tree. Clicking an object shows its properties, attributes and tags.
+3. Tick what you want and click **Export Selected**:
+   - **TXT**: every selected script and object in one readable file, optionally split into ~90k-character parts.
+   - **LUA / LUAU**: one file per script in the original folder structure. Rojo mode maps StarterPlayerScripts → `client/`, ServerScriptService → `server/` and ReplicatedStorage → `shared/`.
 
 ---
 
-## 📖 How to Use
+## Using it from Python
 
-1. **Open a Place File** - Click "Select Roblox Place File" and choose a `.rbxl` or `.rbxlx` file
-2. **Browse the Tree** - Explore the hierarchy of your place file
-3. **Select Items** - Use checkboxes to select scripts and other objects you want to export
-4. **Export** - Click "Export Selected" and choose your preferred format
-5. **Save** - Choose a destination folder and wait for the export to complete
+```python
+import rbxtool
 
----
+doc = rbxtool.load("game.rbxl")
+for script in doc.scripts():
+    print(script.get_path(), script.script_kind, len(script.source))
 
-## 🎯 Export Options
-
-### TXT Export
-- Human-readable format with headers and paths
-- Includes all selected items (scripts, models, folders, remotes, values)
-- Optional auto-split for files exceeding ~90k characters
-
-### LUA Export  
-- Raw code only (no headers or extra text)
-- One file per script
-- Preserves original Roblox folder structure
-- Non-scripts are skipped
-
-### LUAU Export
-- Same as LUA but with `.luau` extension
-- Optional Rojo-adjusted folder structure:
-  - `StarterPlayerScripts` → `client/`
-  - `ServerScriptService` → `server/`
-  - `ReplicatedStorage` → `shared/`
-- Scripts outside these services can be skipped in Rojo mode
-
----
-
-## 📁 Output Structure
-
-### Standard Export
-```
-ExportFolder/
-├── Workspace/
-│   ├── Part/
-│   │   └── Script.server.lua
-│   └── Model/
-│       └── LocalScript.client.lua
-└── ReplicatedStorage/
-    └── ModuleScript.module.lua
-```
-
-### Rojo-Adjusted Export
-```
-ExportFolder/
-├── client/
-│   └── PlayerScript.client.luau
-├── server/
-│   └── ServerScript.server.luau
-└── shared/
-    └── SharedModule.module.luau
+lava = doc.find("Workspace.Lava")
+print(lava.properties["Size"], lava.attributes, lava.tags)
 ```
 
 ---
 
-## 🛠️ Technical Details
+## Development
 
-- Supports both binary (`.rbxl`) and XML (`.rbxlx`) place files
-- Uses LZ4 decompression for binary format
-- Threaded loading to prevent UI freezing on large files
-- Safe filename generation (replaces invalid characters)
+```bash
+pip install -e ".[dev]"
+pytest
+```
 
----
+The test files in `tests/fixtures` are written by [rbx-dom](https://github.com/rojo-rbx/rbx-dom), the library Rojo and Lune use, so the parser is tested against real Roblox-format output. To regenerate them, run `cargo run --manifest-path tests/fixgen/Cargo.toml -- tests/fixtures`.
 
-## 📝 License
+## License
 
-MIT License - Free to use and modify.
+MIT
 
----
+## Author
 
-## 👤 Author
-
-**Undmg**  
-🌐 [undmg.github.io](https://undmg.github.io)
-
----
+**Undmg** · [undmg.github.io](https://undmg.github.io)

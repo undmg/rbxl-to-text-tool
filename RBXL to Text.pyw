@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Roblox Place File Explorer and Script Exporter
 ==============================================
-Version: 10.5.0
+Version: 11.0.0
 
 Changes:
+- 11.0: parsing moved into the shared rbxtool package (also powers the CLI);
+  decodes attributes, tags, RunContext and all property types; opens .rbxm/.rbxmx;
+  recovers what it can from damaged files.
 - Export dialog now has 2 sections:
   1) Format: TXT / LUA / LUAU
   2) File splitting (TXT only)
@@ -63,19 +66,14 @@ try:
 except ImportError:
     missing_libs.append("PyQt5")
 
+# The parser lives in the rbxtool package next to this file (also used by the CLI).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    import lz4.block
-    HAS_LZ4 = True
-except ImportError:
-    HAS_LZ4 = False
-    missing_libs.append("lz4")
-
-try:
-    import zstandard as zstd
-    HAS_ZSTD = True
-except ImportError:
-    HAS_ZSTD = False
-    missing_libs.append("zstandard")
+    import rbxtool
+    from rbxtool.instance import RobloxInstance
+    from rbxtool.values import to_display
+except ImportError as _exc:
+    missing_libs.append(getattr(_exc, "name", None) or "rbxtool")
 
 if missing_libs:
     try:
@@ -86,594 +84,14 @@ if missing_libs:
         messagebox.showerror(
             "Missing Libraries",
             f"Please run this command in Command Prompt:\n\n"
-            f"py -m pip install {' '.join(missing_libs)}\n\n"
+            f"py -m pip install PyQt5 lz4 zstandard\n\n"
             f"Missing: {', '.join(missing_libs)}"
         )
         root.destroy()
     except:
         print(f"Missing libraries: {missing_libs}")
-        print(f"Run: py -m pip install {' '.join(missing_libs)}")
+        print("Run: py -m pip install PyQt5 lz4 zstandard")
     sys.exit(1)
-
-
-# ============================================================================
-# ROBLOX INSTANCE CLASS
-# ============================================================================
-
-class RobloxInstance:
-    def __init__(self, class_name: str, name: str):
-        self.class_name = class_name
-        self.name = name
-        self.properties: Dict[str, Any] = {}
-        self.children: List['RobloxInstance'] = []
-        self.parent: Optional['RobloxInstance'] = None
-        self._id: int = id(self)
-    
-    def __eq__(self, other):
-        if isinstance(other, RobloxInstance):
-            return self._id == other._id
-        return False
-    
-    def __hash__(self):
-        return hash(self._id)
-    
-    def get_path(self) -> str:
-        parts = []
-        current = self
-        while current is not None and current.name != "Game":
-            parts.append(current.name)
-            current = current.parent
-        parts.reverse()
-        return ".".join(parts)
-    
-    def is_script(self) -> bool:
-        return self.class_name in ("Script", "LocalScript", "ModuleScript")
-    
-    def get_script_source(self) -> str:
-        if not self.is_script():
-            return ""
-        for key in ["Source", "source", "ScriptSource", "LinkedSource"]:
-            if key in self.properties and self.properties[key]:
-                val = self.properties[key]
-                if isinstance(val, str):
-                    return val
-                elif isinstance(val, bytes):
-                    return val.decode('utf-8', errors='replace')
-        return ""
-    
-    def is_service(self) -> bool:
-        return self.class_name in (
-            "Workspace", "Players", "Lighting", "MaterialService",
-            "NetworkClient", "ReplicatedFirst", "ReplicatedStorage",
-            "ServerScriptService", "ServerStorage", "StarterGui",
-            "StarterPack", "StarterPlayer", "Teams", "SoundService",
-            "TextChatService", "Chat", "LocalizationService", "TestService",
-            "CoreGui", "HttpService", "RunService", "UserInputService",
-            "TweenService", "Debris", "PhysicsService", "PathfindingService",
-            "CollectionService", "BadgeService", "MarketplaceService",
-            "TeleportService", "DataStoreService", "MemoryStoreService",
-            "MessagingService", "PolicyService", "SocialService",
-            "VoiceChatService", "AvatarEditorService", "InsertService"
-        )
-    
-    def is_remote_or_bindable(self) -> bool:
-        return self.class_name in (
-            "RemoteEvent", "RemoteFunction",
-            "BindableEvent", "BindableFunction",
-            "UnreliableRemoteEvent"
-        )
-    
-    def is_value_object(self) -> bool:
-        return self.class_name in (
-            "StringValue", "IntValue", "NumberValue", "BoolValue",
-            "ObjectValue", "CFrameValue", "Vector3Value", "Color3Value",
-            "BrickColorValue", "RayValue"
-        )
-    
-    def count_children_recursive(self) -> int:
-        count = len(self.children)
-        for child in self.children:
-            count += child.count_children_recursive()
-        return count
-    
-    def find_scripts_recursive(self) -> List['RobloxInstance']:
-        scripts = []
-        if self.is_script():
-            scripts.append(self)
-        for child in self.children:
-            scripts.extend(child.find_scripts_recursive())
-        return scripts
-
-
-# ============================================================================
-# RBXLX PARSER (XML FORMAT)
-# ============================================================================
-
-class RbxlxParser:
-    def __init__(self):
-        self.root = RobloxInstance(class_name="DataModel", name="Game")
-        self.debug_messages = []
-    
-    def parse(self, file_path: str) -> RobloxInstance:
-        self.debug_messages.append(f"Parsing XML file: {file_path}")
-        
-        try:
-            tree = ET.parse(file_path)
-            xml_root = tree.getroot()
-            
-            for element in xml_root:
-                if element.tag == "Item":
-                    instance = self._parse_item_recursive(element)
-                    if instance:
-                        instance.parent = self.root
-                        self.root.children.append(instance)
-            
-            self.debug_messages.append(f"Parsed {len(self.root.children)} root services")
-            return self.root
-            
-        except ET.ParseError as e:
-            raise ValueError(f"XML Parse Error: {e}")
-    
-    def _parse_item_recursive(self, element: ET.Element) -> Optional[RobloxInstance]:
-        class_name = element.get("class", "Unknown")
-        instance = RobloxInstance(class_name=class_name, name=class_name)
-        
-        props_elem = element.find("Properties")
-        if props_elem is not None:
-            for prop in props_elem:
-                prop_name = prop.get("name", "")
-                if not prop_name:
-                    continue
-                
-                value = self._get_property_value(prop)
-                instance.properties[prop_name] = value
-                
-                if prop_name == "Name" and isinstance(value, str) and value:
-                    instance.name = value
-        
-        for child_elem in element:
-            if child_elem.tag == "Item":
-                child_instance = self._parse_item_recursive(child_elem)
-                if child_instance:
-                    child_instance.parent = instance
-                    instance.children.append(child_instance)
-        
-        return instance
-    
-    def _get_property_value(self, prop: ET.Element) -> Any:
-        tag = prop.tag
-        text = prop.text or ""
-        
-        if tag in ("string", "ProtectedString"):
-            return text
-        elif tag == "bool":
-            return text.lower() == "true"
-        elif tag in ("int", "int64"):
-            try:
-                return int(text)
-            except:
-                return 0
-        elif tag in ("float", "double"):
-            try:
-                return float(text)
-            except:
-                return 0.0
-        elif tag == "BinaryString":
-            if text:
-                try:
-                    decoded = base64.b64decode(text)
-                    return decoded.decode('utf-8', errors='replace')
-                except:
-                    return text
-            return ""
-        else:
-            return text
-
-
-# ============================================================================
-# DECOMPRESSION HELPER
-# ============================================================================
-
-def decompress_chunk(data: bytes, decompressed_size: int) -> Optional[bytes]:
-    if len(data) == 0:
-        return b''
-    
-    if len(data) >= 4 and data[0:4] == b'\x28\xb5\x2f\xfd':
-        if HAS_ZSTD:
-            try:
-                dctx = zstd.ZstdDecompressor()
-                return dctx.decompress(data, max_output_size=decompressed_size + 1000)
-            except:
-                pass
-        return None
-    
-    if HAS_LZ4:
-        try:
-            return lz4.block.decompress(data, uncompressed_size=decompressed_size)
-        except:
-            pass
-    
-    if HAS_ZSTD:
-        try:
-            dctx = zstd.ZstdDecompressor()
-            return dctx.decompress(data, max_output_size=decompressed_size + 1000)
-        except:
-            pass
-    
-    return None
-
-
-# ============================================================================
-# RBXL PARSER (BINARY FORMAT)
-# ============================================================================
-
-class RbxlParser:
-    MAGIC = b"<roblox!"
-    SIGNATURE = b"\x89\xff\r\n\x1a\n"
-    
-    def __init__(self):
-        self.root = RobloxInstance(class_name="DataModel", name="Game")
-        self.instances_by_id: Dict[int, RobloxInstance] = {}
-        self.class_names: Dict[int, str] = {}
-        self.class_instance_ids: Dict[int, List[int]] = {}
-        self.shared_strings: Dict[int, str] = {}
-        self.debug_messages = []
-        self.children_added: Set[int] = set()
-    
-    def parse(self, file_path: str) -> RobloxInstance:
-        with open(file_path, 'rb') as f:
-            data = f.read()
-        
-        file_size = len(data)
-        self.debug_messages.append(f"File size: {file_size:,} bytes")
-        
-        if not data.startswith(self.MAGIC):
-            raise ValueError("Not a valid .rbxl file")
-        
-        pos = 8
-        
-        if data[pos:pos+6] == self.SIGNATURE:
-            pos += 6
-            self.debug_messages.append("Has signature: YES")
-        
-        version = struct.unpack('<H', data[pos:pos+2])[0]
-        pos += 2
-        
-        class_count = struct.unpack('<I', data[pos:pos+4])[0]
-        pos += 4
-        
-        instance_count = struct.unpack('<I', data[pos:pos+4])[0]
-        pos += 4
-        
-        self.debug_messages.append(f"Version: {version}, Classes: {class_count}, Instances: {instance_count}")
-        
-        pos += 8
-        
-        self.debug_messages.append(f"Starting chunk parsing at position: {pos}")
-        
-        prnt_chunks = []
-        chunks_parsed = 0
-        inst_count = 0
-        prop_count = 0
-        sstr_count = 0
-        
-        while pos < len(data) - 4:
-            if pos + 16 > len(data):
-                break
-            
-            chunk_name_bytes = data[pos:pos+4]
-            chunk_name = chunk_name_bytes.decode('ascii', errors='ignore').rstrip('\x00')
-            
-            compressed_len = struct.unpack('<I', data[pos+4:pos+8])[0]
-            decompressed_len = struct.unpack('<I', data[pos+8:pos+12])[0]
-            reserved = struct.unpack('<I', data[pos+12:pos+16])[0]
-            pos += 16
-            
-            if chunk_name == "END":
-                self.debug_messages.append("Found END chunk")
-                break
-            
-            if compressed_len > file_size or pos + compressed_len > len(data):
-                break
-            
-            chunk_data_raw = data[pos:pos+compressed_len]
-            pos += compressed_len
-            
-            if compressed_len > 0 and compressed_len != decompressed_len:
-                chunk_data = decompress_chunk(chunk_data_raw, decompressed_len)
-                if chunk_data is None:
-                    continue
-            else:
-                chunk_data = chunk_data_raw
-            
-            try:
-                if chunk_name == "SSTR":
-                    self._parse_sstr_chunk(chunk_data)
-                    sstr_count += 1
-                elif chunk_name == "INST":
-                    self._parse_inst_chunk(chunk_data)
-                    inst_count += 1
-                elif chunk_name == "PROP":
-                    self._parse_prop_chunk(chunk_data)
-                    prop_count += 1
-                elif chunk_name == "PRNT":
-                    prnt_chunks.append(chunk_data)
-            except Exception as e:
-                self.debug_messages.append(f"Error parsing {chunk_name}: {e}")
-            
-            chunks_parsed += 1
-        
-        prnt_count = 0
-        for chunk_data in prnt_chunks:
-            try:
-                self._parse_prnt_chunk(chunk_data)
-                prnt_count += 1
-            except Exception as e:
-                self.debug_messages.append(f"Error parsing PRNT: {e}")
-        
-        self.debug_messages.append(f"Chunks: {chunks_parsed} (SSTR:{sstr_count}, INST:{inst_count}, PROP:{prop_count}, PRNT:{prnt_count})")
-        self.debug_messages.append(f"Instances created: {len(self.instances_by_id)}")
-        self.debug_messages.append(f"Root children: {len(self.root.children)}")
-        
-        for child in self.root.children[:5]:
-            self.debug_messages.append(f"  Root child: {child.name} ({child.class_name})")
-        
-        return self.root
-    
-    def _parse_sstr_chunk(self, data: bytes):
-        if len(data) < 8:
-            return
-        
-        pos = 0
-        version = struct.unpack('<I', data[pos:pos+4])[0]
-        pos += 4
-        
-        count = struct.unpack('<I', data[pos:pos+4])[0]
-        pos += 4
-        
-        for i in range(count):
-            if pos + 20 > len(data):
-                break
-            
-            pos += 16
-            
-            if pos + 4 > len(data):
-                break
-            str_len = struct.unpack('<I', data[pos:pos+4])[0]
-            pos += 4
-            
-            if str_len > 10000000 or pos + str_len > len(data):
-                break
-            
-            string_data = data[pos:pos+str_len].decode('utf-8', errors='replace')
-            pos += str_len
-            
-            self.shared_strings[i] = string_data
-    
-    def _parse_inst_chunk(self, data: bytes):
-        if len(data) < 10:
-            return
-        
-        pos = 0
-        
-        class_id = struct.unpack('<I', data[pos:pos+4])[0]
-        pos += 4
-        
-        name_len = struct.unpack('<I', data[pos:pos+4])[0]
-        pos += 4
-        
-        if name_len > 200 or pos + name_len > len(data):
-            return
-        
-        class_name = data[pos:pos+name_len].decode('utf-8', errors='ignore')
-        pos += name_len
-        
-        self.class_names[class_id] = class_name
-        
-        if pos >= len(data):
-            return
-        pos += 1
-        
-        if pos + 4 > len(data):
-            return
-        count = struct.unpack('<I', data[pos:pos+4])[0]
-        pos += 4
-        
-        if count > 1000000 or pos + count * 4 > len(data):
-            return
-        
-        ids = self._read_referent_array(data[pos:pos+count*4], count)
-        
-        self.class_instance_ids[class_id] = ids
-        
-        for inst_id in ids:
-            instance = RobloxInstance(class_name=class_name, name=class_name)
-            self.instances_by_id[inst_id] = instance
-    
-    def _parse_prop_chunk(self, data: bytes):
-        if len(data) < 10:
-            return
-        
-        pos = 0
-        
-        class_id = struct.unpack('<I', data[pos:pos+4])[0]
-        pos += 4
-        
-        name_len = struct.unpack('<I', data[pos:pos+4])[0]
-        pos += 4
-        
-        if name_len > 200 or pos + name_len > len(data):
-            return
-        
-        prop_name = data[pos:pos+name_len].decode('utf-8', errors='ignore')
-        pos += name_len
-        
-        if pos >= len(data):
-            return
-        prop_type = data[pos]
-        pos += 1
-        
-        if class_id not in self.class_instance_ids:
-            return
-        
-        instance_ids = self.class_instance_ids[class_id]
-        instances = [self.instances_by_id[iid] for iid in instance_ids if iid in self.instances_by_id]
-        
-        if not instances:
-            return
-        
-        try:
-            values = self._read_property_values(data[pos:], prop_type, len(instances))
-            
-            for i, inst in enumerate(instances):
-                if i < len(values):
-                    inst.properties[prop_name] = values[i]
-                    if prop_name == "Name" and values[i]:
-                        if isinstance(values[i], str):
-                            inst.name = values[i]
-                        elif isinstance(values[i], bytes):
-                            inst.name = values[i].decode('utf-8', errors='replace')
-        except:
-            pass
-    
-    def _parse_prnt_chunk(self, data: bytes):
-        if len(data) < 5:
-            return
-        
-        pos = 0
-        
-        version = data[pos]
-        pos += 1
-        
-        count = struct.unpack('<I', data[pos:pos+4])[0]
-        pos += 4
-        
-        if count > 1000000:
-            return
-        
-        if len(data) < pos + count * 8:
-            return
-        
-        child_ids = self._read_referent_array(data[pos:pos+count*4], count)
-        pos += count * 4
-        
-        parent_ids = self._read_referent_array(data[pos:pos+count*4], count)
-        
-        for i in range(count):
-            child_id = child_ids[i]
-            parent_id = parent_ids[i]
-            
-            if child_id not in self.instances_by_id:
-                continue
-            
-            if child_id in self.children_added:
-                continue
-            
-            child = self.instances_by_id[child_id]
-            
-            if parent_id in self.instances_by_id:
-                parent = self.instances_by_id[parent_id]
-                child.parent = parent
-                parent.children.append(child)
-            else:
-                child.parent = self.root
-                self.root.children.append(child)
-            
-            self.children_added.add(child_id)
-    
-    def _read_referent_array(self, data: bytes, count: int) -> List[int]:
-        if len(data) < count * 4:
-            return []
-        
-        result = []
-        accumulator = 0
-        
-        for i in range(count):
-            b0 = data[i] if i < len(data) else 0
-            b1 = data[count + i] if count + i < len(data) else 0
-            b2 = data[count * 2 + i] if count * 2 + i < len(data) else 0
-            b3 = data[count * 3 + i] if count * 3 + i < len(data) else 0
-            
-            value = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
-            value = (value >> 1) ^ (-(value & 1))
-            
-            accumulator += value
-            result.append(accumulator)
-        
-        return result
-    
-    def _read_property_values(self, data: bytes, prop_type: int, count: int) -> List[Any]:
-        values = []
-        pos = 0
-        
-        if prop_type == 0x01:
-            for _ in range(count):
-                if pos + 4 > len(data):
-                    values.append("")
-                    continue
-                slen = struct.unpack('<I', data[pos:pos+4])[0]
-                pos += 4
-                if slen > 10000000 or pos + slen > len(data):
-                    values.append("")
-                    continue
-                values.append(data[pos:pos+slen].decode('utf-8', errors='replace'))
-                pos += slen
-        
-        elif prop_type == 0x02:
-            for i in range(count):
-                if pos + i < len(data):
-                    values.append(bool(data[pos + i]))
-                else:
-                    values.append(False)
-        
-        elif prop_type == 0x03:
-            values = self._read_referent_array(data[pos:], count)
-        
-        elif prop_type == 0x04:
-            for i in range(count):
-                if pos + count * 4 <= len(data):
-                    b0 = data[pos + i]
-                    b1 = data[pos + count + i] if pos + count + i < len(data) else 0
-                    b2 = data[pos + count * 2 + i] if pos + count * 2 + i < len(data) else 0
-                    b3 = data[pos + count * 3 + i] if pos + count * 3 + i < len(data) else 0
-                    float_bytes = bytes([b3, b2, b1, b0])
-                    try:
-                        values.append(struct.unpack('<f', float_bytes)[0])
-                    except:
-                        values.append(0.0)
-                else:
-                    values.append(0.0)
-        
-        elif prop_type == 0x05:
-            for _ in range(count):
-                if pos + 8 <= len(data):
-                    values.append(struct.unpack('<d', data[pos:pos+8])[0])
-                    pos += 8
-                else:
-                    values.append(0.0)
-        
-        elif prop_type == 0x20:
-            for _ in range(count):
-                if pos + 4 > len(data):
-                    values.append("")
-                    continue
-                slen = struct.unpack('<I', data[pos:pos+4])[0]
-                pos += 4
-                if slen > 50000000 or pos + slen > len(data):
-                    values.append("")
-                    continue
-                values.append(data[pos:pos+slen].decode('utf-8', errors='replace'))
-                pos += slen
-        
-        elif prop_type == 0x21:
-            indices = self._read_referent_array(data[pos:], count)
-            for idx in indices:
-                values.append(self.shared_strings.get(idx, ""))
-        
-        else:
-            values = [""] * count
-        
-        return values
 
 
 # ============================================================================
@@ -794,20 +212,10 @@ class LoaderThread(QThread):
     def run(self):
         try:
             self.progress.emit("Reading file...")
-            
-            ext = os.path.splitext(self.file_path)[1].lower()
-            
-            if ext == ".rbxlx":
-                parser = RbxlxParser()
-            elif ext == ".rbxl":
-                parser = RbxlParser()
-            else:
-                self.finished.emit(ValueError(f"Unknown file type: {ext}"), [])
-                return
-            
-            result = parser.parse(self.file_path)
-            self.finished.emit(result, parser.debug_messages)
-            
+            doc = rbxtool.load(self.file_path)
+            messages = [f"{doc.format} {doc.kind}, {doc.file_size:,} bytes"]
+            messages += [f"WARNING: {w}" for w in doc.warnings]
+            self.finished.emit(doc.root, messages)
         except Exception as e:
             import traceback
             self.finished.emit(e, [traceback.format_exc()])
@@ -910,6 +318,7 @@ class ExportOptionsDialog(QDialog):
             "     • One file per script (raw code only)\n"
             f"     • Approximately {self.script_count} .luau files\n"
             "     • Extensions: .client.luau / .server.luau / .module.luau\n"
+            "       (Rojo mode uses .client.luau / .server.luau / .luau)\n"
             "     • Non-scripts are skipped"
         )
         luau_info.setStyleSheet("color: #a0a0a0; font-size: 11px; margin-left: 25px;")
@@ -1650,7 +1059,7 @@ class MainWindow(QMainWindow):
     def select_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select Roblox Place File", "",
-            "Roblox Place Files (*.rbxl *.rbxlx);;All Files (*.*)"
+            "Roblox Files (*.rbxl *.rbxlx *.rbxm *.rbxmx);;All Files (*.*)"
         )
         if path:
             self.load_file(path)
@@ -2040,12 +1449,12 @@ class MainWindow(QMainWindow):
                     os.makedirs(out_dir, exist_ok=True)
 
                     base_name = rel_parts[-1]
-                    if inst.class_name == "LocalScript":
+                    # Rojo naming: RunContext-aware, and modules are plain .luau
+                    kind = inst.script_kind
+                    if kind == "client":
                         filename = f"{base_name}.client{script_ext}"
-                    elif inst.class_name == "Script":
+                    elif kind in ("server", "plugin"):
                         filename = f"{base_name}.server{script_ext}"
-                    elif inst.class_name == "ModuleScript":
-                        filename = f"{base_name}.module{script_ext}"
                     else:
                         filename = f"{base_name}{script_ext}"
 
@@ -2065,9 +1474,10 @@ class MainWindow(QMainWindow):
                     os.makedirs(out_dir, exist_ok=True)
 
                     base_name = safe_parts[-1]
-                    if inst.class_name == "LocalScript":
+                    kind = inst.script_kind  # RunContext-aware
+                    if kind == "client":
                         filename = f"{base_name}.client{script_ext}"
-                    elif inst.class_name == "Script":
+                    elif kind in ("server", "plugin"):
                         filename = f"{base_name}.server{script_ext}"
                     elif inst.class_name == "ModuleScript":
                         filename = f"{base_name}.module{script_ext}"
@@ -2125,14 +1535,17 @@ class MainWindow(QMainWindow):
             for k in sorted(inst.properties.keys()):
                 if k.lower() == "source":
                     continue
-                v = inst.properties.get(k)
-                try:
-                    s = str(v)
-                except Exception:
-                    s = repr(v)
-                if len(s) > 500:
-                    s = s[:500] + "…"
-                lines.append(f"  - {k}: {s}")
+                if k in ("AttributesSerialize", "Tags"):
+                    continue
+                lines.append(f"  - {k}: {to_display(inst.properties.get(k), 500)}")
+        if inst.attributes:
+            lines.append("")
+            lines.append("Attributes:")
+            for k in sorted(inst.attributes):
+                lines.append(f"  - {k}: {to_display(inst.attributes[k], 500)}")
+        if inst.tags:
+            lines.append("")
+            lines.append(f"Tags: {', '.join(inst.tags)}")
         lines.append("")
         return "\n".join(lines)
 

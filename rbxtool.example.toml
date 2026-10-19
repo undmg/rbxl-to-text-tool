@@ -1,0 +1,20 @@
+# Copy to rbxtool.toml in your repository. `rbxtool check` finds it by
+# searching upwards from the current directory (or pass --config).
+
+[check]
+# Lowest severity that makes `rbxtool check` exit with code 1: error, warning, info or never.
+fail_on = "error"
+
+# Rules to skip entirely.
+disable = []
+
+# Change a rule's severity.
+[check.severity]
+RBX010 = "info"
+
+# More [check] options (TOML needs them above any [check.severity] table,
+# so move these up if you use them):
+#
+# ignore = ["Workspace.ThirdParty.*"]   # instance paths to skip (glob patterns)
+# max_file_size = "20MB"                # fail if the file is bigger than this
+# max_growth_percent = 10               # with --baseline old.rbxl: fail if it grew more

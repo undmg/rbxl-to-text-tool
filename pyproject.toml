@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rbxtool"
+version = "2.0.0.dev0"
+description = "Read, diff and check Roblox place and model files without Studio"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Undmg" }]
+requires-python = ">=3.9"
+dependencies = ["lz4>=3", "zstandard>=0.18", "tomli>=1.1; python_version < '3.11'"]
+
+[project.optional-dependencies]
+gui = ["PyQt5>=5.15"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+rbxtool = "rbxtool.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/undmg/rbxl-to-text-tool"
+
+[tool.setuptools.packages.find]
+include = ["rbxtool*"]
